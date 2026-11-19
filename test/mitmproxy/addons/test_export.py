@@ -123,13 +123,97 @@ class TestExportCurlCommand:
         assert shlex.split(command)[-1] == "'&#"
 
     def test_expand_escaped(self, export_curl, post_request):
+        # Control characters are replayed through a piped printf: the body is
+        # split into literal segments (%s) and one %b conversion per control
+        # byte, then fed to curl via --data-binary @- so no newline is
+        # stripped and no "@file" interpretation is possible. A trailing
+        # no-op "%s" with an empty argument keeps the argument-to-conversion
+        # mapping identical across printf implementations (see request_body_pipe).
         post_request.request.content = b"foo\nbar"
-        result = "curl -X POST http://address:22/path -d \"$(printf 'foo\\x0abar')\""
+        result = (
+            "printf %s%b%s%s foo '\\012' bar '' | "
+            "curl -X POST http://address:22/path --data-binary @-"
+        )
         assert export_curl(post_request) == result
 
     def test_no_expand_when_no_escaped(self, export_curl, post_request):
         post_request.request.content = b"foobar"
         result = "curl -X POST http://address:22/path -d foobar"
+        assert export_curl(post_request) == result
+
+    @pytest.mark.parametrize(
+        "content,expected_body_snippet",
+        [
+            # Class 1: percent encoding / template placeholders together with a
+            # control char. Percent signs stay literal inside a %s segment, the
+            # newline is a separate %b octal argument -- nothing is handed to
+            # printf as a format string.
+            (
+                b"search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d\n",
+                "printf %s%b%s "
+                "'search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d' "
+                "'\\012' ''",
+            ),
+            # Class 2: Windows path with literal backslashes. The backslashes
+            # live in a literal %s segment and are therefore never interpreted
+            # as escape sequences (no injected tab/newline); the trailing
+            # newline is a separate %b octal argument.
+            (
+                b"path=C:\\tmp\\new\\report.txt\n",
+                "printf %s%b%s 'path=C:\\tmp\\new\\report.txt' '\\012' ''",
+            ),
+            # Class 3: body ending in a newline. The trailing newline is a real
+            # %b argument; because the bytes travel through a pipe rather than
+            # a "$(...)" substitution, nothing strips it.
+            (
+                b"line1\nline2\n",
+                "printf %s%b%s%b%s line1 '\\012' line2 '\\012' ''",
+            ),
+            # Class 4: body starting with "@". It is piped to --data-binary @-,
+            # so curl never treats the body itself as a file reference.
+            (
+                b"@replay-token: keep me",
+                "printf %s%s '@replay-token: keep me' ''",
+            ),
+        ],
+    )
+    def test_special_bodies_use_byte_exact_pipe(
+        self, export_curl, post_request, content, expected_body_snippet
+    ):
+        post_request.request.content = content
+        result = export_curl(post_request)
+        assert result == (
+            f"{expected_body_snippet} | "
+            "curl -X POST http://address:22/path --data-binary @-"
+        )
+
+    def test_multiline_body_internal_newlines_preserved(self, export_curl, post_request):
+        # Multi-line control case: internal CR/LF bytes are each emitted as
+        # separate %b octal arguments, in order, with literal text between them.
+        post_request.request.content = b"alpha\nbeta\r\ngamma"
+        result = (
+            "printf %s%b%s%b%b%s%s alpha '\\012' beta '\\015' '\\012' gamma '' | "
+            "curl -X POST http://address:22/path --data-binary @-"
+        )
+        assert export_curl(post_request) == result
+
+    def test_control_free_body_keeps_plain_dash_d_form(self, export_curl, post_request):
+        # Control group: a body without control characters and without a
+        # leading "@" keeps the original simple "-d <quoted body>" form.
+        post_request.request.content = b"simple-body-123"
+        result = "curl -X POST http://address:22/path -d simple-body-123"
+        assert export_curl(post_request) == result
+
+    def test_at_prefixed_body_without_control_uses_pipe(
+        self, export_curl, post_request
+    ):
+        # A leading "@" forces the pipe form even when no control character is
+        # present, because plain "-d @..." would be read as a file reference.
+        post_request.request.content = b"@replay-token: keep me"
+        result = (
+            "printf %s%s '@replay-token: keep me' '' | "
+            "curl -X POST http://address:22/path --data-binary @-"
+        )
         assert export_curl(post_request) == result
 
     def test_strip_unnecessary(self, export_curl, get_request):
@@ -171,7 +255,9 @@ class TestExportHttpieCommand:
 
     def test_post(self, post_request):
         post_request.request.content = b"nobinarysupport"
-        result = "http POST http://address:22/path <<< nobinarysupport"
+        result = (
+            "printf %s%s nobinarysupport '' | http POST http://address:22/path"
+        )
         assert export.httpie_command(post_request) == result
 
     def test_fails_with_binary_data(self, post_request):
@@ -182,7 +268,10 @@ class TestExportHttpieCommand:
             export.httpie_command(post_request)
 
     def test_patch(self, patch_request):
-        result = """http PATCH 'http://address:22/path?query=param' 'header: qvalue' <<< content"""
+        result = (
+            "printf %s%s content '' | "
+            "http PATCH 'http://address:22/path?query=param' 'header: qvalue'"
+        )
         assert export.httpie_command(patch_request) == result
 
     def test_tcp(self, tcp_flow):
@@ -198,8 +287,71 @@ class TestExportHttpieCommand:
             req=tutils.treq(method=b"POST", headers=(), content=b"'&#")
         )
         command = export.httpie_command(request)
-        assert shlex.split(command)[-2] == "<<<"
-        assert shlex.split(command)[-1] == "'&#"
+        # The body is emitted by a piped printf; shlex.quote encodes the
+        # embedded single quote as a closed/open single-quote pair.
+        tokens = shlex.split(command)
+        assert tokens[0] == "printf"
+        assert "'&#" in tokens
+        assert command.endswith("| http POST http://address:22/path")
+
+    @pytest.mark.parametrize(
+        "content,expected_body_snippet",
+        [
+            # Same four construction cases as the curl exporter: httpie uses
+            # the identical printf pipe criterion instead of a here-string.
+            (
+                b"search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d\n",
+                "printf %s%b%s "
+                "'search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d' "
+                "'\\012' ''",
+            ),
+            (
+                b"path=C:\\tmp\\new\\report.txt\n",
+                "printf %s%b%s 'path=C:\\tmp\\new\\report.txt' '\\012' ''",
+            ),
+            (
+                b"line1\nline2\n",
+                "printf %s%b%s%b%s line1 '\\012' line2 '\\012' ''",
+            ),
+            (
+                b"@replay-token: keep me",
+                "printf %s%s '@replay-token: keep me' ''",
+            ),
+        ],
+    )
+    def test_special_bodies_use_byte_exact_pipe(self, content, expected_body_snippet):
+        request = tflow.tflow(
+            req=tutils.treq(method=b"POST", headers=(), content=content)
+        )
+        result = export.httpie_command(request)
+        assert result == (
+            f"{expected_body_snippet} | http POST http://address:22/path"
+        )
+
+    def test_multiline_body_internal_newlines_preserved(self):
+        # Multi-line control case, same encoding as the curl path.
+        request = tflow.tflow(
+            req=tutils.treq(
+                method=b"POST", headers=(), content=b"alpha\nbeta\r\ngamma"
+            )
+        )
+        result = (
+            "printf %s%b%s%b%b%s%s alpha '\\012' beta '\\015' '\\012' gamma '' | "
+            "http POST http://address:22/path"
+        )
+        assert export.httpie_command(request) == result
+
+    def test_control_free_body_uses_pipe_without_here_string(self):
+        # Control group: even a plain body is piped rather than sent through a
+        # here-string, because here-strings are bash-only and append a newline.
+        request = tflow.tflow(
+            req=tutils.treq(method=b"POST", headers=(), content=b"simple-body-123")
+        )
+        result = (
+            "printf %s%s simple-body-123 '' | http POST http://address:22/path"
+        )
+        assert export.httpie_command(request) == result
+        assert "<<<" not in result
 
     # See comment in `TestExportCurlCommand.test_correct_host_used`. httpie
     # currently doesn't have a way of forcing connection to a particular IP, so

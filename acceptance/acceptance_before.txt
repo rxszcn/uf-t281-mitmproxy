@@ -1,0 +1,50 @@
+修复前（上游原始导出器）真实执行读数
+====================================
+
+读数口径：对快照内 127.0.0.1:8765 回显服务真实执行各例导出命令，
+捕获重放字节与录制原文逐字节比对。shell 为 git-bash 自带 bash 5.3 与
+dash（POSIX 模式）。以下为实际观测，非推断。
+
+curl 路径（旧实现：控制字符体走 -d "$(printf ...)"，@开头走 -d '@...'）
+----------------------------------------------------------------------
+class1 百分号/模板（含尾部换行）
+  bash/dash: 不一致；首个差异字节 7，got 0x30 want 0x25；长度 53 vs 51
+  机理：体作为 printf 格式串，%2f/%x/%d 被当转换说明符消费
+class2 Windows 反斜杠路径（含尾部换行）
+  bash/dash: 不一致；首个差异字节 7，got 0x09(TAB) want 0x5c(反斜杠)；长度 23 vs 27
+  机理：printf 解释 \t/\n，制表符/换行注入路径中间，尾部换行再被 $() 吞掉
+class3 以换行结尾
+  bash/dash: 不一致；前缀相同仅长度不同，got 11 want 12（尾部 \n 丢失）
+  机理："$(...)" 命令替换剥离全部尾随换行
+class4 @开头
+  bash/dash: 请求未发出；curl 报 "Failed to open replay-token: keep me"
+            + "option -d: error encountered when reading a file"
+  机理：-d '@...' 被 curl 当文件引用
+class5 多行控制字符对照（alpha\nbeta\r\ngamma）
+  bash/dash: 一致
+class6 无控制字符对照体
+  bash/dash: 一致
+
+httpie 路径（旧实现：<<< "$(printf ...)" / <<< '<体>'）
+------------------------------------------------------
+class1 百分号/模板
+  bash: 不一致；首个差异字节 7，got 0x30 want 0x25；长度 54 vs 51（printf 转换 + 尾随换行）
+  dash: 请求未发出；dash 报 "Syntax error: redirection unexpected"（<<< 非 POSIX）
+class2 Windows 反斜杠路径
+  bash: 不一致；首个差异字节 7，got 0x09 want 0x5c；长度 24 vs 27
+  dash: 语法错误，请求未发出
+class3 以换行结尾
+  bash: 一致（here-string 补的换行恰好补上被 $() 吞掉的换行，属巧合非正确构造）
+  dash: 语法错误，请求未发出
+class4 @开头
+  bash: 不一致；长度 23 vs 22（here-string 追加一个换行）
+  dash: 语法错误，请求未发出
+class5 多行控制字符
+  bash: 不一致；长度 18 vs 17（here-string 追加换行）
+  dash: 语法错误，请求未发出
+class6 无控制字符对照体
+  bash: 不一致；长度 16 vs 15（here-string 追加换行）
+  dash: 语法错误，请求未发出
+
+结论：旧实现在 curl 路径有 4 类失真、httpie 路径同源失真且在精简 POSIX
+shell 下完全无法执行。修复后读数见 acceptance_after.txt（20/20 逐字节一致）。

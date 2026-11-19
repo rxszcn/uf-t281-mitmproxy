@@ -1,0 +1,46 @@
+=== class1_percent_encoding_and_template ===
+recorded bytes (51): b'search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d\n'
+[curl] printf %s%b%s 'search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d' '\012' '' | curl -X POST http://127.0.0.1:8765/ingest --data-binary @-
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+[httpie] printf %s%b%s 'search=%2fhome&tpl={{user}}/profile&pct=%x&id=99%d' '\012' '' | http POST http://127.0.0.1:8765/ingest
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+
+=== class2_windows_path_backslashes ===
+recorded bytes (27): b'path=C:\\tmp\\new\\report.txt\n'
+[curl] printf %s%b%s 'path=C:\tmp\new\report.txt' '\012' '' | curl -X POST http://127.0.0.1:8765/ingest --data-binary @-
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+[httpie] printf %s%b%s 'path=C:\tmp\new\report.txt' '\012' '' | http POST http://127.0.0.1:8765/ingest
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+
+=== class3_trailing_newline ===
+recorded bytes (12): b'line1\nline2\n'
+[curl] printf %s%b%s%b%s line1 '\012' line2 '\012' '' | curl -X POST http://127.0.0.1:8765/ingest --data-binary @-
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+[httpie] printf %s%b%s%b%s line1 '\012' line2 '\012' '' | http POST http://127.0.0.1:8765/ingest
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+
+=== class4_at_prefix ===
+recorded bytes (22): b'@replay-token: keep me'
+[curl] printf %s%s '@replay-token: keep me' '' | curl -X POST http://127.0.0.1:8765/ingest --data-binary @-
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+[httpie] printf %s%s '@replay-token: keep me' '' | http POST http://127.0.0.1:8765/ingest
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+
+=== control_group_no_control_chars ===
+recorded bytes (15): b'simple-body-123'
+[curl] curl -X POST http://127.0.0.1:8765/ingest -d simple-body-123
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+[httpie] printf %s%s simple-body-123 '' | http POST http://127.0.0.1:8765/ingest
+  bash: CONSISTENT (byte-exact)
+  dash: CONSISTENT (byte-exact)
+
+summary: 20/20 byte-exact, 0 failing

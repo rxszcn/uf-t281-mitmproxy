@@ -43,7 +43,7 @@ def cleanup_response(f: flow.Flow) -> http.Response:
     return response
 
 
-def request_content_for_console(request: http.Request) -> str:
+def _request_text(request: http.Request) -> str:
     try:
         text = request.get_text(strict=True)
         assert text
@@ -51,13 +51,85 @@ def request_content_for_console(request: http.Request) -> str:
         # shlex.quote doesn't support a bytes object
         # see https://github.com/python/cpython/pull/10871
         raise exceptions.CommandError("Request content must be valid unicode")
-    escape_control_chars = {chr(i): f"\\x{i:02x}" for i in range(32)}
-    escaped_text = "".join(escape_control_chars.get(x, x) for x in text)
-    if any(char in escape_control_chars for char in text):
-        # Escaped chars need to be unescaped by the shell to be properly inperpreted by curl and httpie
-        return f'"$(printf {shlex.quote(escaped_text)})"'
+    return text
 
-    return shlex.quote(escaped_text)
+
+def request_content_for_console(request: http.Request) -> str:
+    """Quote a request body for direct placement on a curl/httpie command line.
+
+    This is only safe for "simple" bodies: bodies without ASCII control
+    characters and bodies that do not begin with ``@``. A literal ``@`` prefix
+    would make curl interpret the argument as a file reference (``-d @file``),
+    and control characters cannot be represented faithfully as a plain
+    argument. Such bodies are handled by :func:`request_body_pipe`.
+    """
+    return shlex.quote(_request_text(request))
+
+
+def _needs_pipe_encoding(text: str) -> bool:
+    return text.startswith("@") or any(ord(char) < 32 for char in text)
+
+
+def request_body_pipe(request: http.Request) -> str:
+    """Return a shell snippet that emits the request body on stdout, byte for byte.
+
+    The snippet has the form::
+
+        printf '<format string>' '<arg>' ...
+
+    and is intended to be piped into the replaying tool (``curl --data-binary
+    @-`` / httpie on stdin). Rationale for the construction:
+
+    * ``printf '<body>'`` (the previous approach) passes the recorded body as
+      the *format string*, so percent sequences such as ``%2f`` or ``%x`` are
+      consumed as conversions, and command substitution (``"$(...)"``) strips
+      every trailing newline.
+    * The body is therefore split into literal text segments and control
+      characters. Literal segments are emitted through ``%s`` conversions, so
+      neither ``%`` nor backslashes (as in Windows paths like ``C:\\tmp``) are
+      ever interpreted; each control character gets its own ``%b`` conversion
+      paired with a three-digit octal ``\\0NN`` argument, which every POSIX
+      ``printf`` decodes to exactly that byte.
+    * Piping stdout into the tool avoids both curl's ``@file`` interpretation
+      of an at-prefixed body and curl's newline stripping with plain ``-d``;
+      ``--data-binary @-`` forwards the piped bytes unchanged. It also keeps
+      the command POSIX-shell compatible, unlike bash-only here-strings
+      (``<<<``), which additionally append a newline.
+    """
+    text = _request_text(request)
+    format_parts: list[str] = []
+    arguments: list[str] = []
+    literal: list[str] = []
+
+    def flush_literal() -> None:
+        if literal:
+            format_parts.append("%s")
+            arguments.append("".join(literal))
+            literal.clear()
+
+    for char in text:
+        code = ord(char)
+        if code < 32:
+            flush_literal()
+            format_parts.append("%b")
+            arguments.append(f"\\{code:03o}")
+        else:
+            literal.append(char)
+    flush_literal()
+
+    # Trailing no-op conversion with an empty argument. Some printf builds
+    # (observed with Git for Windows' dash/bash) do not restart the format
+    # string on extra arguments when the format ends in a conversion
+    # specifier; instead they feed surplus arguments into the trailing
+    # conversion. A final "%s" paired with an empty argument emits no bytes
+    # while making the format end cleanly, so every body segment maps to its
+    # own conversion on every POSIX shell.
+    format_parts.append("%s")
+    arguments.append("")
+
+    return "printf " + shlex.quote("".join(format_parts)) + " " + " ".join(
+        shlex.quote(argument) for argument in arguments
+    )
 
 
 def curl_command(f: flow.Flow) -> str:
@@ -96,7 +168,15 @@ def curl_command(f: flow.Flow) -> str:
 
     command = " ".join(shlex.quote(arg) for arg in args)
     if request.content:
-        command += f" -d {request_content_for_console(request)}"
+        body_text = _request_text(request)
+        if _needs_pipe_encoding(body_text):
+            # Pipe the body byte-for-byte: --data-binary @- neither strips
+            # newlines nor interprets a leading "@" as a file reference.
+            command = (
+                f"{request_body_pipe(request)} | {command} --data-binary @-"
+            )
+        else:
+            command += f" -d {request_content_for_console(request)}"
     return command
 
 
@@ -114,7 +194,12 @@ def httpie_command(f: flow.Flow) -> str:
         args.append(f"{k}: {v}")
     cmd = " ".join(shlex.quote(arg) for arg in args)
     if request.content:
-        cmd += " <<< " + request_content_for_console(request)
+        # Always pipe the body: here-strings ("<<<") are bash-only (a syntax
+        # error in a POSIX shell) and append an extra newline, so they can
+        # never reproduce the recorded bytes. The same pipe criterion as in
+        # curl_command applies; simple bodies are emitted with a single
+        # "printf %s" segment.
+        cmd = f"{request_body_pipe(request)} | {cmd}"
     return cmd
 
 
